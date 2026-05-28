@@ -1,3 +1,9 @@
+#![allow(
+    clippy::needless_range_loop,
+    clippy::new_without_default,
+    clippy::type_complexity,
+    dead_code
+)]
 //! # Wasserstein Agents
 //!
 //! Optimal transport, Wasserstein distances, and agent distribution coordination.

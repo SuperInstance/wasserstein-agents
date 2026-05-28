@@ -44,7 +44,7 @@ impl JKOScheme {
     /// One JKO step with quadratic potential.
     fn jko_step_quadratic(&self, dist: &AgentDistribution) -> AgentDistribution {
         let n = dist.len();
-        let d = dist.dimension();
+        let _d = dist.dimension();
         if n == 0 {
             return dist.clone();
         }

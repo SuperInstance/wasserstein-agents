@@ -30,7 +30,7 @@ impl SinkhornSolver {
         let eps = self.regularization;
 
         // Kernel matrix K = exp(-C/ε)
-        let mut k: Vec<Vec<f64>> = (0..n)
+        let k: Vec<Vec<f64>> = (0..n)
             .map(|i| {
                 (0..m)
                     .map(|j| (-cost[i][j] / eps).exp().max(1e-300))
