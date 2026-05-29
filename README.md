@@ -37,3 +37,5 @@ let trajectory = jko.flow_to_origin(&fleet);
 ## License
 
 MIT
+
+Part of the [SuperInstance OpenConstruct](https://github.com/SuperInstance/OpenConstruct) ecosystem.
