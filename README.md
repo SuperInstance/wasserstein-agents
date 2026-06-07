@@ -1,261 +1,377 @@
 # wasserstein-agents
 
-**Wasserstein distance, optimal transport, and agent distribution coordination.**
-
-A Rust library for computing optimal transport plans, Wasserstein distances, and evolving agent distributions via gradient flow. Built on the Sinkhorn-Knopp algorithm with log-domain numerical stability.
-
-## What This Does
-
-This library provides three things:
-
-1. **Sinkhorn solver** — Compute entropy-regularized optimal transport plans between discrete distributions.
-2. **Wasserstein distances** — W₁ and W₂ metrics between probability distributions.
-3. **JKO gradient flow** — Evolve distributions over time using the Jordan-Kinderlehrer-Otto scheme.
-
-The "agents" framing: model a fleet of agents as a probability distribution over state space, then use optimal transport to coordinate, compare, and evolve them.
-
-## Key Idea
-
-The **Wasserstein distance** (Earth Mover's Distance) measures how much "work" it takes to reshape one distribution into another. Unlike KL divergence, it respects the geometry of the underlying space — two point masses that are close cost less to transport than far-apart ones.
-
-The **Sinkhorn algorithm** computes an approximate optimal transport plan by adding entropy regularization. This makes the problem strictly convex and solvable via iterative row/column normalization of a Gibbs kernel:
-
-```
-K = exp(-C / ε)
-```
-
-where C is the cost matrix and ε controls regularization strength.
-
-The **JKO scheme** discretizes Wasserstein gradient flow as a sequence of proximal steps:
-
-```
-μ_{t+1} = argmin_ν { τ·F(ν) + W₂²(μ_t, ν) / 2 }
-```
-
-This evolves a distribution toward the minimum of an energy functional F, in the geometry of optimal transport.
-
-## Install
-
-Add to your `Cargo.toml`:
-
-```toml
-[dependencies]
-wasserstein-agents = "0.1.0"
-```
-
-Or use `cargo add`:
-
-```sh
-cargo add wasserstein-agents
-```
-
-Requires Rust 2021 edition. No external dependencies — pure Rust.
-
-## Quick Start
+Measure how different your agents are. Make them converge. The Wasserstein distance is the cost of turning one distribution into another — literally the price of moving the dirt.
 
 ```rust
-use wasserstein_agents::{SinkhornSolver, OptimalTransport, AgentDistribution};
-
-// Define a cost matrix
-let cost = vec![
-    vec![0.0, 1.0, 2.0],
-    vec![1.0, 0.0, 1.0],
-    vec![2.0, 1.0, 0.0],
-];
-let mu = vec![0.5, 0.3, 0.2];
-let nu = vec![0.2, 0.3, 0.5];
-
-// Compute Wasserstein-2 distance
-let w2 = OptimalTransport::wasserstein_2(&cost, &mu, &nu);
-println!("W₂ = {}", w2);
-
-// Get the full transport plan
-let solver = SinkhornSolver::new(0.1);
-let plan = solver.solve(&cost, &mu, &nu);
-// plan[i][j] = mass transported from source i to target j
-
-// Work with agent distributions
-let fleet = AgentDistribution::uniform(vec![
-    vec![0.0, 0.0],
-    vec![1.0, 0.0],
-    vec![0.0, 1.0],
-]);
-let targets = AgentDistribution::uniform(vec![
-    vec![1.0, 1.0],
-    vec![2.0, 0.0],
-    vec![0.0, 2.0],
-]);
-
-// Distance between two agent configurations
-let dist = fleet.wasserstein_distance(&targets);
-
-// Optimal assignment plan
-let assignment = fleet.optimal_assignment(&targets);
+use wasserstein_agents::*;
 ```
 
-### Gradient Flow
+---
+
+## 1. Earth Mover's Distance: The Intuition
+
+Agent A produces outputs clustered around [1, 2, 3]. Agent B produces outputs around [4, 5, 6]. How far apart are they? Not "are any values the same?" but "how much total work to morph A into B?"
+
+```rust
+use wasserstein_agents::AgentDistribution;
+
+// Agent A: conservative, outputs near 1-3
+let agent_a = AgentDistribution::uniform(vec![
+    vec![1.0], vec![2.0], vec![3.0],
+]);
+
+// Agent B: aggressive, outputs near 4-6
+let agent_b = AgentDistribution::uniform(vec![
+    vec![4.0], vec![5.0], vec![6.0],
+]);
+
+// Earth Mover's Distance: how much work to turn A into B?
+let distance = agent_a.wasserstein_distance(&agent_b);
+println!("W₂(A, B) = {:.3}", distance);
+// ~5.0 — you'd need to shift each point by ~3 units on average
+// This IS a metric: symmetric, non-negative, triangle inequality
+
+// Compare with itself — should be ~0
+let self_dist = agent_a.wasserstein_distance(&agent_a);
+println!("W₂(A, A) = {:.3} (should be ~0)", self_dist);
+```
+
+---
+
+## 2. Agent Distributions: Mean, Covariance, Spread
+
+```rust
+use wasserstein_agents::AgentDistribution;
+
+// An agent that produces 2D outputs: [latency, throughput]
+let agent = AgentDistribution::weighted(
+    vec![
+        vec![12.0, 950.0],  // normal run
+        vec![13.0, 940.0],  // normal run
+        vec![11.0, 960.0],  // normal run
+        vec![45.0, 500.0],  // degraded run
+    ],
+    vec![0.3, 0.3, 0.3, 0.1], // mostly normal, sometimes degraded
+);
+
+println!("{} samples, {}D state space", agent.len(), agent.dimension());
+
+let mean = agent.mean();
+println!("Mean: [{:.1}, {:.1}]", mean[0], mean[1]);
+// Mean latency ~17.5, throughput ~870
+
+let cov = agent.covariance();
+println!("Covariance:");
+println!("  Var(latency)     = {:.1}", cov[0][0]);
+println!("  Var(throughput)  = {:.1}", cov[1][1]);
+println!("  Cov(lat, tput)   = {:.1}", cov[0][1]);
+// High variance in latency = inconsistent performance
+
+// Distance matrix: how far apart are the agent's own samples?
+let dm = agent.distance_matrix();
+println!("Distance from sample 0 to 3: {:.1}", dm[0][3]);
+// The degraded run (sample 3) is far from normal runs
+```
+
+### Spreading Agents Apart
+
+```rust
+let spread = agent.spread(2.0); // move each sample 2x away from centroid
+let mean_before = agent.mean();
+let mean_after = spread.mean();
+println!("Mean before: [{:.1}, {:.1}]", mean_before[0], mean_before[1]);
+println!("Mean after:  [{:.1}, {:.1}]", mean_after[0], mean_after[1]);
+// Mean stays the same — spreading is symmetric around the centroid
+let spread_dist = agent.wasserstein_distance(&spread);
+println!("W₂(original, spread) = {:.1}", spread_dist);
+```
+
+---
+
+## 3. Sinkhorn Algorithm: Step by Step
+
+The Sinkhorn algorithm solves optimal transport by adding entropy regularization. It alternates between normalizing rows and columns.
+
+```rust
+use wasserstein_agents::SinkhornSolver;
+
+// Cost matrix: cost[i][j] = cost of moving mass from position i to position j
+let cost = vec![
+    vec![0.0, 1.0, 2.0, 3.0],
+    vec![1.0, 0.0, 1.0, 2.0],
+    vec![2.0, 1.0, 0.0, 1.0],
+    vec![3.0, 2.0, 1.0, 0.0],
+];
+
+let mu = vec![0.25, 0.25, 0.25, 0.25]; // uniform source
+let nu = vec![0.25, 0.25, 0.25, 0.25]; // uniform target
+
+let solver = SinkhornSolver::new(0.1); // regularization ε=0.1
+let plan = solver.solve(&cost, &mu, &nu);
+
+println!("Transport plan:");
+for (i, row) in plan.iter().enumerate() {
+    print!("  from {}: [", i);
+    for (j, &val) in row.iter().enumerate() {
+        print!("{:.3} ", val);
+    }
+    println!("]");
+}
+// When source = target (both uniform), the plan is approximately diagonal
+// Mass stays put when there's no reason to move it
+
+let total_cost = SinkhornSolver::transport_cost(&plan, &cost);
+println!("Total transport cost: {:.4}", total_cost);
+// Should be close to 0 — nothing needs to move
+```
+
+### Asymmetric Distributions
+
+```rust
+use wasserstein_agents::SinkhornSolver;
+
+let cost = vec![
+    vec![0.0, 1.0, 4.0],
+    vec![1.0, 0.0, 1.0],
+    vec![4.0, 1.0, 0.0],
+];
+
+let mu = vec![0.5, 0.5, 0.0]; // mass at positions 0 and 1
+let nu = vec![0.0, 0.5, 0.5]; // mass at positions 1 and 2
+
+let solver = SinkhornSolver::new(0.05);
+let plan = solver.solve(&cost, &mu, &nu);
+
+println!("Moving mass from [0.5, 0.5, 0] to [0, 0.5, 0.5]:");
+for (i, row) in plan.iter().enumerate() {
+    println!("  from {} (mass {:.1}): to [{:.3}, {:.3}, {:.3}]",
+        i, mu[i], row[0], row[1], row[2]);
+}
+
+// Verify marginals
+for (i, row) in plan.iter().enumerate() {
+    let row_sum: f64 = row.iter().sum();
+    println!("Row {} sum: {:.3} (should be {:.3})", i, row_sum, mu[i]);
+}
+for j in 0..3 {
+    let col_sum: f64 = plan.iter().map(|r| r[j]).sum();
+    println!("Col {} sum: {:.3} (should be {:.3})", j, col_sum, nu[j]);
+}
+```
+
+---
+
+## 4. Wasserstein-1 vs Wasserstein-2
+
+```rust
+use wasserstein_agents::OptimalTransport;
+
+let cost = vec![
+    vec![0.0, 1.0, 4.0, 9.0],
+    vec![1.0, 0.0, 1.0, 4.0],
+    vec![4.0, 1.0, 0.0, 1.0],
+    vec![9.0, 4.0, 1.0, 0.0],
+];
+
+let mu = vec![0.5, 0.5, 0.0, 0.0];
+let nu = vec![0.0, 0.0, 0.5, 0.5];
+
+let w1 = OptimalTransport::wasserstein_1(&cost, &mu, &nu);
+let w2 = OptimalTransport::wasserstein_2(&cost, &mu, &nu);
+
+println!("W₁ = {:.3}", w1); // linear cost: Σ cᵢⱼ Tᵢⱼ
+println!("W₂ = {:.3}", w2); // quadratic cost: √(Σ cᵢⱼ² Tᵢⱼ)
+// W₂ penalizes long-distance moves more harshly
+// W₁ treats all moves linearly — "1 unit of dirt moved 3 units costs 3"
+// W₂ squres the distance — "1 unit of dirt moved 3 units costs 9"
+
+let w2_sq = OptimalTransport::wasserstein_2_squared(&cost, &mu, &nu);
+println!("W₂² = {:.3}", w2_sq);
+```
+
+---
+
+## 5. Comparing Two Agent Fleets
+
+```rust
+use wasserstein_agents::AgentDistribution;
+
+// Fleet A: 3 agents producing embeddings in 2D
+let fleet_a = AgentDistribution::uniform(vec![
+    vec![0.0, 1.0],
+    vec![1.0, 0.0],
+    vec![0.5, 0.5],
+]);
+
+// Fleet B: same agents after fine-tuning — embeddings shifted
+let fleet_b = AgentDistribution::uniform(vec![
+    vec![0.1, 1.2],
+    vec![1.1, 0.1],
+    vec![0.6, 0.4],
+]);
+
+let dist = fleet_a.wasserstein_distance(&fleet_b);
+println!("W₂(fleet A, fleet B) = {:.3}", dist);
+// Small distance = fine-tuning didn't break things
+
+// Optimal assignment: which agent in A maps to which in B?
+let plan = fleet_a.optimal_assignment(&fleet_b);
+println!("Optimal transport plan:");
+for (i, row) in plan.iter().enumerate() {
+    let best_j = row.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(j, _)| j);
+    println!("  A[{}] → B[{}] (mass {:.3})",
+        i, best_j.unwrap(), row[best_j.unwrap()]);
+}
+```
+
+---
+
+## 6. JKO Gradient Flow: Agents Evolving Over Time
+
+The Jordan-Kinderlehrer-Otto (JKO) scheme evolves a distribution by minimizing transport cost + functional cost at each step. It's gradient descent *in the space of distributions*.
+
+```rust
+use wasserstein_agents::{AgentDistribution, JKOScheme};
+
+// Start with agents scattered far from origin
+let initial = AgentDistribution::uniform(vec![
+    vec![5.0], vec![-3.0], vec![2.0], vec![-4.0], vec![1.0],
+]);
+
+// JKO with quadratic potential: drives agents toward origin
+let jko = JKOScheme::new(0.1, 50); // dt=0.1, 50 steps
+let trajectory = jko.flow_to_origin(&initial);
+
+println!("Gradient flow trajectory:");
+for (step, dist) in trajectory.iter().enumerate() {
+    let mean = dist.mean();
+    if step % 10 == 0 || step == trajectory.len() - 1 {
+        println!("  t={:5.1}: mean={:.3}, positions={:?}",
+            step as f64 * 0.1,
+            mean[0],
+            dist.positions.iter().map(|p| format!("{:.2}", p[0]))
+                .collect::<Vec<_>>());
+    }
+}
+
+let final_dist = trajectory.last().unwrap();
+let final_mean = final_dist.mean();
+println!("\nFinal mean: [{:.4}] (converging to 0)", final_mean[0]);
+
+// Track the Wasserstein distance between consecutive steps
+let w_traj = jko.wasserstein_trajectory(&trajectory);
+println!("Step sizes (W₂ between consecutive distributions):");
+for (i, &w) in w_traj.iter().enumerate() {
+    if i < 5 || i >= w_traj.len() - 2 {
+        println!("  step {}: W₂ = {:.4}", i, w);
+    }
+}
+// Steps get smaller as the distribution converges
+```
+
+### Custom Potential: Drive Agents to Any Target
 
 ```rust
 use wasserstein_agents::{AgentDistribution, JKOScheme};
 
 let initial = AgentDistribution::uniform(vec![
-    vec![3.0], vec![-3.0], vec![1.0], vec![-1.0],
+    vec![0.0, 0.0],
+    vec![1.0, 1.0],
+    vec![-1.0, 2.0],
 ]);
 
-// Evolve toward the origin (heat equation / quadratic potential)
-let jko = JKOScheme::new(0.1, 50);
-let trajectory = jko.flow_to_origin(&initial);
+// Potential: V(x,y) = (x-3)² + (y-3)² → drives to (3,3)
+let grad_v = |p: &[f64]| vec![2.0 * (p[0] - 3.0), 2.0 * (p[1] - 3.0)];
 
-// Each step moves the distribution closer to the minimum
-for (t, dist) in trajectory.iter().enumerate() {
-    println!("t={}: mean = {:?}", t, dist.mean());
+let jko = JKOScheme::new(0.05, 100);
+let traj = jko.flow_with_potential(&initial, grad_v);
+
+let final_pos = &traj.last().unwrap().positions;
+println!("After 100 steps:");
+for (i, p) in final_pos.iter().enumerate() {
+    println!("  agent {}: ({:.2}, {:.2})", i, p[0], p[1]);
 }
-
-// Custom potential: V(x) = 0.5|x|² → ∇V(x) = x
-let grad_v = |x: &[f64]| x.to_vec();
-let custom_traj = jko.flow_with_potential(&initial, grad_v);
+// All agents should be near (3, 3)
 ```
+
+---
+
+## 7. Barycenter: The "Average" Distribution
+
+The Wasserstein barycenter is the Fréchet mean in distribution space — the distribution that minimizes total transport cost to all input distributions.
+
+```rust
+use wasserstein_agents::OptimalTransport;
+
+// Three agent distributions (1D, on a shared grid of 5 points)
+let grid = vec![0.0, 1.0, 2.0, 3.0, 4.0];
+
+// Distribution 1: peaked at 0
+let mu1 = vec![0.5, 0.3, 0.1, 0.05, 0.05];
+// Distribution 2: peaked at 4
+let mu2 = vec![0.05, 0.05, 0.1, 0.3, 0.5];
+// Distribution 3: peaked at 2 (middle)
+let mu3 = vec![0.1, 0.2, 0.4, 0.2, 0.1];
+
+let cost: Vec<Vec<f64>> = (0..5)
+    .map(|i| (0..5).map(|j| (grid[i] - grid[j]).powi(2)).collect())
+    .collect();
+
+let distributions = vec![
+    (&mu1[..], &cost),
+    (&mu2[..], &cost),
+    (&mu3[..], &cost),
+];
+let weights = vec![1.0/3.0, 1.0/3.0, 1.0/3.0];
+
+let bary = OptimalTransport::barycenter(&distributions, &weights, 20);
+
+println!("Barycenter distribution:");
+for (i, &v) in bary.iter().enumerate() {
+    println!("  x={:.0}: {:.3} {}", grid[i], v, "█".repeat((v * 50.0) as usize));
+}
+// Should be peaked in the middle — the "consensus" of the three distributions
+// Unlike Euclidean averaging of probabilities (which is just the arithmetic mean),
+// the Wasserstein barycenter respects the geometry of the underlying space
+```
+
+---
+
+## The Full Picture
+
+```
+Agent A (distribution)    Agent B (distribution)
+        ↓                         ↓
+        └─── cost matrix ────────┘
+                     ↓
+              Sinkhorn solver
+                     ↓
+           Transport plan T[i][j]
+           "how much mass from i to j"
+                     ↓
+         W₁ = Σ cᵢⱼ Tᵢⱼ     (linear cost)
+         W₂ = √(Σ cᵢⱼ² Tᵢⱼ)  (quadratic cost)
+                     ↓
+        ┌────────────┼────────────┐
+        ↓            ↓            ↓
+    Compare     Barycenter    Gradient flow
+    agents      (average)     (converge)
+```
+
+- **W₁**: "Total fuel to move the dirt." Linear. Treats all distances equally.
+- **W₂**: "Total fuel²." Quadratic. Penalizes long-range moves. Has a Riemannian structure — you can do gradient descent in distribution space.
+- **Barycenter**: The "average" distribution. Respects geometry, unlike arithmetic mean.
+- **JKO flow**: Gradient descent in Wasserstein space. Your agents converge to a target distribution over time.
+
+---
 
 ## API Reference
 
-### `SinkhornSolver`
-
-Entropy-regularized optimal transport via the Sinkhorn-Knopp algorithm.
-
-| Method | Description |
-|--------|-------------|
-| `new(regularization)` | Create solver with entropy parameter ε |
-| `solve(cost, mu, nu) → Vec<Vec<f64>>` | Compute transport plan T[i][j] |
-| `transport_cost(plan, cost) → f64` | Total cost of a transport plan |
-
-**Parameters:**
-- `regularization` — Entropy strength ε. Smaller → closer to exact OT, but slower convergence and potential numerical issues. Typical: 0.01–0.1.
-- `max_iterations` — Defaults to 1000.
-- `tolerance` — Convergence threshold. Defaults to 1e-8.
-
-### `OptimalTransport`
-
-Static methods for Wasserstein distances.
-
-| Method | Description |
-|--------|-------------|
-| `wasserstein_1(cost, mu, nu) → f64` | W₁ distance (Earth Mover's) |
-| `wasserstein_2(cost, mu, nu) → f64` | W₂ distance (square root) |
-| `wasserstein_2_squared(cost, mu, nu) → f64` | W₂² distance |
-| `barycenter(distributions, weights, n_iter) → Vec<f64>` | Fréchet mean of distributions |
-
-### `AgentDistribution`
-
-A probability distribution over agent positions in state space.
-
-| Method | Description |
-|--------|-------------|
-| `uniform(positions)` | Uniform weights over given positions |
-| `weighted(positions, weights)` | Explicit weights |
-| `len() → usize` | Number of agents |
-| `dimension() → usize` | State space dimension |
-| `mean() → Vec<f64>` | Center of mass |
-| `covariance() → Vec<Vec<f64>>` | Covariance matrix |
-| `distance_matrix() → Vec<Vec<f64>>` | Pairwise Euclidean distances |
-| `wasserstein_distance(other) → f64` | W₂ to another distribution |
-| `optimal_assignment(targets) → Vec<Vec<f64>>` | Transport plan to targets |
-| `spread(factor) → AgentDistribution` | Dilate positions from centroid |
-
-### `JKOScheme`
-
-Wasserstein gradient flow via the Jordan-Kinderlehrer-Otto scheme.
-
-| Method | Description |
-|--------|-------------|
-| `new(dt, n_steps)` | Create scheme with time step and step count |
-| `flow_to_origin(initial) → Vec<AgentDistribution>` | Quadratic potential flow |
-| `flow_with_potential(initial, grad_v) → Vec<AgentDistribution>` | Custom potential flow |
-| `wasserstein_trajectory(trajectory) → Vec<f64>` | W₂ distances between consecutive steps |
-
-## How It Works
-
-### Sinkhorn Algorithm
-
-1. **Build the Gibbs kernel**: K = exp(-C/ε) where C is the cost matrix.
-2. **Iterate in log domain**: Maintain dual variables u, v. Alternately project onto row constraints (u update) and column constraints (v update).
-3. **Recover the plan**: T[i][j] = exp(u[i]) · K[i][j] · exp(v[j]).
-4. **Convergence check**: Stop when dual variables change by less than the tolerance.
-
-Log-domain stabilization prevents numerical underflow when ε is small.
-
-### Wasserstein Distances
-
-- **W₁**: Sinkhorn with small ε (≈0.01), then dot-product of plan with cost.
-- **W₂²**: Same computation with squared-distance cost matrix.
-- **W₂**: Square root of W₂².
-
-### JKO Scheme
-
-Each JKO step solves a regularized optimal transport problem:
-
-1. Compute the proximal update: move positions toward the energy minimum.
-2. Solve OT between current and candidate distributions.
-3. Update weights from the transport plan's column marginals.
-4. Normalize to maintain total mass = 1.
-
-For the quadratic potential V(x) = ½|x|², the proximal operator is simply x → x/(1 + τ).
-
-### Barycenter
-
-The Wasserstein barycenter minimizes the weighted sum of Wasserstein distances to a set of input distributions. Computed via fixed-point iteration: alternately transport each input distribution toward the current barycenter estimate, then update the barycenter as the weighted average of the push-forwards.
-
-## The Math
-
-### Optimal Transport Problem
-
-Given source distribution μ ∈ Δⁿ, target ν ∈ Δᵐ, and cost matrix C ∈ ℝⁿˣᵐ:
-
-$$\min_{T \in \Pi(\mu, \nu)} \sum_{i,j} C_{ij} T_{ij}$$
-
-where Π(μ, ν) is the set of transport plans with marginals μ (rows) and ν (columns).
-
-### Entropy-Regularized OT (Sinkhorn)
-
-$$\min_{T \in \Pi(\mu, \nu)} \sum_{i,j} C_{ij} T_{ij} + \varepsilon \sum_{i,j} T_{ij} \log T_{ij}$$
-
-The entropy term makes the problem strictly convex. The optimal solution has the form:
-
-$$T_{ij} = \exp(u_i) \cdot K_{ij} \cdot \exp(v_j)$$
-
-where K = exp(-C/ε) and u, v are the Sinkhorn dual variables found by alternating projection.
-
-### Wasserstein-p Distance
-
-$$W_p(\mu, \nu) = \left( \min_{T \in \Pi(\mu, \nu)} \sum_{i,j} |x_i - x_j|^p \cdot T_{ij} \right)^{1/p}$$
-
-For p = 1 this is the Earth Mover's Distance. For p = 2 it gives the natural Riemannian structure on the space of probability distributions (the Wasserstein-2 geometry).
-
-### JKO Gradient Flow
-
-The gradient flow of a functional F in Wasserstein-2 geometry is discretized as:
-
-$$\mu^{n+1} = \arg\min_{\nu} \left\{ \tau \cdot F(\nu) + \frac{1}{2} W_2^2(\mu^n, \nu) \right\}$$
-
-For F(ν) = ∫ ½|x|² dν (quadratic potential), the flow is the heat equation, and distributions converge to a Dirac delta at the origin.
-
-### Wasserstein Barycenter
-
-$$\bar{\mu} = \arg\min_{\nu} \sum_{k=1}^{K} \lambda_k \cdot W_2^2(\nu, \mu_k)$$
-
-where λₖ are non-negative weights summing to 1. This generalizes the Euclidean mean to the curved Wasserstein space.
-
-## Test Coverage
-
-16 tests covering:
-- Sinkhorn convergence on identity-cost and asymmetric distributions
-- Marginal preservation verification
-- W₁ and W₂ on identical and different distributions
-- Transport cost computation
-- Agent distribution statistics (mean, covariance, distance matrix)
-- JKO convergence to origin, trajectory length, mass preservation
-- Custom potential gradient flow
-- Wasserstein trajectory between time steps
-
-## License
-
-MIT
+| Type | What it does |
+|------|-------------|
+| `AgentDistribution` | Positions + weights. Mean, covariance, distance matrix. Wasserstein distance. |
+| `SinkhornSolver` | Entropy-regularized optimal transport. Returns transport plan matrix. |
+| `OptimalTransport` | W₁, W₂, W₂² distances. Barycenter computation. |
+| `JKOScheme` | Wasserstein gradient flow. Quadratic potential, custom potentials, trajectory tracking. |
